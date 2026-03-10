@@ -980,11 +980,8 @@ class MooncakeConnectorWorker:
         now = time.perf_counter()
 
         expired_req_ids = []
-        # Create a copy of items to avoid concurrent modification issues
-        reqs_to_recv_items = list(self.reqs_to_recv.items())
-        for remote_engine_id, pull_metas in reqs_to_recv_items:
-            pull_metas_items = list(pull_metas.items())
-            for req_id, pull_meta in pull_metas_items:
+        for remote_engine_id, pull_metas in self.reqs_to_recv.items():
+            for req_id, pull_meta in pull_metas.items():
                 if pull_meta.expire_time < now:
                     logger.warning(
                         "Request %s timed out after %d seconds without "
@@ -998,8 +995,7 @@ class MooncakeConnectorWorker:
 
         # Remove expired requests from tracking
         for remote_engine_id, req_id in expired_req_ids:
-            if remote_engine_id in self.reqs_to_recv and req_id in self.reqs_to_recv[remote_engine_id]:
-                del self.reqs_to_recv[remote_engine_id][req_id]
+            del self.reqs_to_recv[remote_engine_id][req_id]
 
         return finished_recving_reqs
 
@@ -1102,6 +1098,7 @@ class MooncakeConnectorWorker:
                 while True:
                     ret_msg = await sock.recv()
                     response = self._xfer_resp_decoder.decode(ret_msg)
+                    self.process_pulling_result(response, pull_metas)
                     if response.status == MooncakeXferResponseStatus.ERROR:
                         logger.error(
                             "Error happens during tranfering kvcache for %s: %s",
@@ -1109,7 +1106,6 @@ class MooncakeConnectorWorker:
                             response.err_msg,
                         )
                         return
-                    self.process_pulling_result(response, pull_metas)
                     if response.status == MooncakeXferResponseStatus.FINISH:
                         break
         except zmq.ContextTerminated:
@@ -1230,6 +1226,9 @@ class MooncakeConnectorWorker:
     async def _start_load_kv(
         self, reqs_to_recv: dict[EngineId, dict[ReqId, PullReqMeta]]
     ):
+        # Store requests to receive for timeout tracking; all reqs_to_recv
+        # operations happen in receiver_loop to avoid race conditions.
+        self.reqs_to_recv.update(reqs_to_recv)
         for remote_engine_id, pull_metas in reqs_to_recv.items():
             if remote_engine_id not in self._remote_agents:
                 asyncio.create_task(
@@ -1268,8 +1267,6 @@ class MooncakeConnectorWorker:
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
         if not self.is_kv_producer and metadata.reqs_to_recv:
-            # Store requests to receive for timeout tracking
-            self.reqs_to_recv.update(metadata.reqs_to_recv)
             asyncio.run_coroutine_threadsafe(
                 self._start_load_kv(metadata.reqs_to_recv), self.receiver_loop
             )
